@@ -176,17 +176,51 @@ putoctal(char *dst, unsigned num, int size)
 		eprintf("snprintf: input number too large\n");
 }
 
+static void
+fillchksum(struct header *h)
+{
+	char *b;
+	size_t i, chksum;
+
+	b = (char *)h;
+	memset(h->chksum, ' ', sizeof(h->chksum));
+	for (i = 0, chksum = 0; i < sizeof(*h); i++)
+		chksum += (unsigned char)b[i];
+	putoctal(h->chksum, chksum, sizeof(h->chksum));
+}
+
+static size_t
+xhdradd(char xhdr[], size_t max, const char *k, const char *v, size_t vlen)
+{
+	size_t sz, prevsz;
+
+	/* The size of the message includes itself, so compute it via iteration. */
+	prevsz = max;
+	while (1) {
+		sz = snprintf(xhdr, max, "%ld %s=%.*s\n", prevsz, k, (int)vlen, v);
+		if (sz == max)
+			eprintf("pax headers too large\n");
+		if (sz == prevsz)
+			return sz;
+		prevsz = sz;
+	}
+}
+
 static int
 archive(const char *path)
 {
 	char b[BLKSIZ];
+	char xb[BLKSIZ];
+	char xhdr[8192];
+	char link[4096];
 	struct group *gr;
-	struct header *h;
+	struct header *h, *xh;
 	struct passwd *pw;
 	struct stat st;
-	size_t chksum, i;
+	size_t xhdroffset, pathlen;
 	ssize_t l, r;
 	int fd = -1;
+	xhdroffset = 0;
 
 	if (lstat(path, &st) < 0) {
 		weprintf("lstat %s:", path);
@@ -201,7 +235,7 @@ archive(const char *path)
 
 	h = (struct header *)b;
 	memset(b, 0, sizeof(b));
-	estrlcpy(h->name,    path,                        sizeof(h->name));
+	strncpy (h->name,    path,                        sizeof(h->name));
 	putoctal(h->mode,    (unsigned)st.st_mode & 0777, sizeof(h->mode));
 	putoctal(h->uid,     (unsigned)st.st_uid,         sizeof(h->uid));
 	putoctal(h->gid,     (unsigned)st.st_gid,         sizeof(h->gid));
@@ -211,6 +245,12 @@ archive(const char *path)
 	memcpy(  h->version, "00",                        sizeof(h->version));
 	estrlcpy(h->uname,   pw ? pw->pw_name : "",       sizeof(h->uname));
 	estrlcpy(h->gname,   gr ? gr->gr_name : "",       sizeof(h->gname));
+
+	h->name[sizeof(h->name)-1] = 0;
+	pathlen = strlen(path);
+	if (pathlen >= sizeof(h->name)) {
+		xhdroffset += xhdradd(&xhdr[xhdroffset], sizeof(xhdr)-xhdroffset, "path", path, pathlen);
+	}
 
 	if (S_ISREG(st.st_mode)) {
 		h->type = REG;
@@ -222,9 +262,16 @@ archive(const char *path)
 		h->type = DIRECTORY;
 	} else if (S_ISLNK(st.st_mode)) {
 		h->type = SYMLINK;
-		if ((r = readlink(path, h->linkname, sizeof(h->linkname) - 1)) < 0)
+		if ((r = readlink(path, link, sizeof(link) - 1)) < 0)
 			eprintf("readlink %s:", path);
-		h->linkname[r] = '\0';
+		if (r == sizeof(link))
+			eprintf("link target too long\n");
+		link[r] = '\0';
+		strncpy(h->linkname, link, sizeof(h->linkname));
+		h->linkname[sizeof(h->linkname)-1] = 0;
+		if (r >= sizeof(h->linkname)) {
+			xhdroffset += xhdradd(&xhdr[xhdroffset], sizeof(xhdr)-xhdroffset, "linkpath", link, r);
+		}
 	} else if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode)) {
 		h->type = S_ISCHR(st.st_mode) ? CHARDEV : BLOCKDEV;
 		putoctal(h->major, (unsigned)major(st.st_dev), sizeof(h->major));
@@ -233,10 +280,24 @@ archive(const char *path)
 		h->type = FIFO;
 	}
 
-	memset(h->chksum, ' ', sizeof(h->chksum));
-	for (i = 0, chksum = 0; i < sizeof(*h); i++)
-		chksum += (unsigned char)b[i];
-	putoctal(h->chksum, chksum, sizeof(h->chksum));
+	if (xhdroffset) {
+		xh = (struct header *)xb;
+		memset(xb, 0, sizeof(xb));
+		xh->type = 'x';
+		putoctal(xh->size,    xhdroffset,  sizeof(xh->size));
+		memcpy(  xh->magic,   "ustar",     sizeof(h->magic));
+		memcpy(  xh->version, "00",        sizeof(h->version));
+		fillchksum(xh);
+		ewrite(tarfd, xb, BLKSIZ);
+		ewrite(tarfd, xhdr, xhdroffset);
+		if (xhdroffset % BLKSIZ) {
+			l = BLKSIZ - (xhdroffset % BLKSIZ);
+			memset(xb, 0, l);
+			ewrite(tarfd, xb, l);
+		}
+	}
+
+	fillchksum(h);
 	ewrite(tarfd, b, BLKSIZ);
 
 	if (fd != -1) {
@@ -412,7 +473,7 @@ chktar(struct header *h)
 	const char *reason;
 	long s1, s2, i;
 
-	if (h->prefix[0] == '\0' && h->name[0] == '\0') {
+	if (h->prefix[0] == '\0' && h->name[0] == '\0' && h->type != 'x') {
 		reason = "empty filename";
 		goto bad;
 	}
